@@ -566,26 +566,83 @@ function go(n){
 document.getElementById('next').onclick=()=>go(cur+1);
 document.getElementById('prev').onclick=()=>go(cur-1);
 const STORE_KEY='sgdea-progreso-v1';
-function saveProgress(){
+const API='/api/progress';
+let lastV=0;            // versión más reciente que hemos aplicado (la asigna el servidor)
+let pendingPush=false;  // hay cambios locales sin sincronizar todavía
+let pushTimer=null;
+let firstPull=true;     // primera lectura del servidor (para cargar estado existente)
+
+// Recolecta el estado actual de los checkboxes en un objeto { mi: [ri,...] }
+function collectState(){
   const data={};
   document.querySelectorAll('.reqtab.viewed').forEach(t=>{
     const mi=t.dataset.mi; (data[mi]=data[mi]||[]).push(t.dataset.ri);
   });
-  try{localStorage.setItem(STORE_KEY,JSON.stringify(data));}catch(e){}
+  return data;
 }
-function restoreProgress(){
-  let data; try{data=JSON.parse(localStorage.getItem(STORE_KEY)||'{}');}catch(e){data={};}
-  Object.keys(data).forEach(mi=>{
-    (data[mi]||[]).forEach(ri=>{
-      const t=document.querySelector('.reqtab[data-mi="'+mi+'"][data-ri="'+ri+'"]');
-      if(t) t.classList.add('viewed');
-    });
+// Aplica un estado (selección) al DOM (marca y desmarca) y refresca todas las barras
+function applyState(sel){
+  sel=sel||{};
+  document.querySelectorAll('.reqtab').forEach(t=>{
+    const arr=sel[t.dataset.mi]||[];
+    t.classList.toggle('viewed', arr.indexOf(t.dataset.ri)>=0);
   });
-  // Actualizar todas las barras de cada módulo
   document.querySelectorAll('.mod-body').forEach(body=>{
     const any=body.querySelector('.reqtab'); if(any) updateProgress(any.dataset.mi, body);
   });
   updateGlobalProgress();
+}
+// Lee del localStorage soportando el formato nuevo {_v,sel} y el viejo (objeto plano)
+function readLocal(){
+  let o; try{o=JSON.parse(localStorage.getItem(STORE_KEY)||'{}');}catch(e){o={};}
+  if(o && typeof o._v!=='undefined' && o.sel) return {v:o._v, sel:o.sel};
+  return {v:0, sel:o||{}};
+}
+function writeLocal(v,sel){ try{localStorage.setItem(STORE_KEY,JSON.stringify({_v:v,sel:sel}));}catch(e){} }
+
+// Guarda: local al instante + envía al servidor (debounce). El servidor devuelve la
+// versión asignada para no revertir nuestro propio cambio mientras propaga la caché.
+function saveProgress(){
+  const sel=collectState();
+  writeLocal(lastV,sel);
+  pendingPush=true;
+  clearTimeout(pushTimer);
+  pushTimer=setTimeout(async ()=>{
+    try{
+      const r=await fetch(API,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sel:sel})});
+      if(r.ok){ const j=await r.json(); if(j&&j._v){ lastV=Math.max(lastV,j._v); writeLocal(lastV,sel); } }
+    }catch(e){}
+    finally{pendingPush=false;}
+  },300);
+}
+// Lee el estado del servidor; solo lo aplica si es MÁS NUEVO que el nuestro (evita que
+// una lectura en caché vieja borre lo que acabamos de seleccionar).
+async function pullProgress(){
+  if(pendingPush) return; // no pisar cambios locales aún no sincronizados
+  try{
+    const r=await fetch(API,{cache:'no-store'});
+    if(!r.ok) return;
+    const doc=await r.json();           // { _v, sel }
+    const v=(doc&&doc._v)||0;
+    const sel=(doc&&doc.sel)||{};
+    if(v>lastV || (firstPull && v>=lastV)){
+      lastV=Math.max(lastV,v);
+      writeLocal(lastV,sel);
+      applyState(sel);
+    }
+    firstPull=false;
+  }catch(e){}
+}
+function restoreProgress(){
+  // 1) Estado local al instante (sin esperar red)
+  const loc=readLocal();
+  lastV=loc.v;
+  applyState(loc.sel);
+  // 2) Estado compartido del servidor + sincronización periódica entre dispositivos
+  pullProgress();
+  setInterval(pullProgress,3000);
+  // Al volver a la pestaña, sincroniza de inmediato (más ágil entre dispositivos)
+  document.addEventListener('visibilitychange',()=>{ if(!document.hidden) pullProgress(); });
 }
 function updateProgress(mi, body){
   const total = DATA.resumen[+mi].total;
